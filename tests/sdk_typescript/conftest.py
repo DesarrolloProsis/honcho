@@ -5,7 +5,9 @@ This module provides fixtures for running TypeScript SDK tests against a real HT
 The server uses the same test database and mocks as the Python tests.
 """
 
+import asyncio
 import socket
+import sys
 import threading
 import time
 from collections.abc import Generator
@@ -32,7 +34,21 @@ class TestServer:
             app, host="127.0.0.1", port=port, log_level="warning"
         )
         self.server: Server = uvicorn.Server(self.config)
-        self.thread: Thread = threading.Thread(target=self.server.run, daemon=True)
+        self.thread: Thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self) -> None:
+        """Run the server, forcing the selector loop on Windows.
+
+        Server.run() builds its loop from uvicorn's own factory, which returns
+        ProactorEventLoop on win32 for a non-subprocess config. psycopg cannot
+        run on it, so every request this server handles fails with
+        InterfaceError -- the SDK's setup hooks then time out and the whole bun
+        suite fails with no obvious cause. Same root cause as windows/run_api.py.
+        """
+        if sys.platform == "win32":
+            asyncio.run(self.server.serve(), loop_factory=asyncio.SelectorEventLoop)
+        else:
+            self.server.run()
 
     def start(self) -> None:
         self.thread.start()
