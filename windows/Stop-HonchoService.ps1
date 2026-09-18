@@ -13,15 +13,23 @@
     leaves TWO derivers polling the same queue.
 
     This script:
-      1. asks the process tree to shut down gracefully (CTRL_BREAK_EVENT, which
-         the deriver handles as SIGBREAK),
+      1. attempts a graceful shutdown (CTRL_BREAK_EVENT, which the deriver
+         handles as SIGBREAK),
       2. stops the scheduled task,
       3. force-kills anything still alive,
       4. VERIFIES nothing remains, and fails loudly if it does.
 
-    Graceful shutdown is attempted first so in-flight queue work is drained
-    rather than abandoned. Windows cannot deliver SIGTERM from outside a
-    process, so CTRL_BREAK is the only graceful lever available.
+    MEASURED CAVEAT on step 1: GenerateConsoleCtrlEvent requires the target PID
+    to be a process GROUP LEADER. A service-launched deriver is not -- the chain
+    is wscript -> cmd -> python, and python inherits cmd's group. So for the
+    normal service case the CTRL_BREAK is a no-op and step 3 does the work.
+    It succeeds only when the process was started directly from a console, or
+    spawned with CREATE_NEW_PROCESS_GROUP.
+
+    Force-killing a deriver is survivable: queue items it had claimed are
+    reclaimed after their lease expires. The property that matters here is that
+    the stop is COMPLETE and VERIFIED, not that it is graceful. Do not read a
+    successful run as "it shut down cleanly".
 
 .PARAMETER TaskName
     Scheduled task to stop. Defaults to both Honcho tasks.
