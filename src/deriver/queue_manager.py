@@ -1279,8 +1279,16 @@ async def main():
     try:
         await manager.initialize()
     except Exception as e:
-        logger.error(f"Error in main: {str(e)}")
+        # logger.exception records the traceback and the exception type. The
+        # previous f"{str(e)}" logged an EMPTY message for any exception raised
+        # without arguments -- which is how NotImplementedError from
+        # loop.add_signal_handler() surfaced as a bare "Error in main: ".
+        logger.exception("Error in main")
         sentry_sdk.capture_exception(e)
+        # Re-raise: swallowing here returned normally, so the process exited 0
+        # and a supervisor (Task Scheduler, systemd, a container runtime) saw a
+        # clean shutdown and never restarted a dead worker.
+        raise
     finally:
         await close_cache()
         logger.debug("Main function exiting")

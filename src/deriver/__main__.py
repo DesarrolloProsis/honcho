@@ -127,7 +127,12 @@ if __name__ == "__main__":
         asyncio.run(run_deriver(), loop_factory=loop_factory())
     except KeyboardInterrupt:
         logger.info("Shutdown initiated via KeyboardInterrupt")
-    except Exception as e:
-        logger.exception("Error in main process: %s", e)
+    except Exception:
+        logger.exception("Error in main process")
+        # Exit non-zero so a supervisor can tell a crash from a clean stop.
+        # Task Scheduler's restart-on-failure policy keys off the exit code,
+        # so logging and returning normally left the deriver dead and the
+        # task reporting success.
+        raise SystemExit(1) from None
     finally:
         logger.info("Deriver process exiting")
