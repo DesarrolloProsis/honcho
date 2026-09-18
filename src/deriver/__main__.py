@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
+import sys
+from collections.abc import Callable
 
-import uvloop
 from prometheus_client import start_http_server
 
 from src.config import settings
@@ -22,6 +23,29 @@ from src.telemetry import (
 from .queue_manager import main
 
 logger = logging.getLogger(__name__)
+
+
+def loop_factory() -> Callable[[], asyncio.AbstractEventLoop]:
+    """Select the event loop implementation for this platform.
+
+    uvloop is Linux/macOS only -- the lockfile excludes it on win32 -- so
+    importing it at module scope makes this module unimportable on Windows.
+    Windows additionally requires the selector loop specifically: psycopg's
+    async implementation cannot run on the default ProactorEventLoop.
+
+    A factory is returned rather than calling asyncio.set_event_loop_policy()
+    because the policy system is deprecated in 3.14 and slated for removal in
+    3.16, and this project declares requires-python >=3.13 with no upper bound.
+
+    Returns:
+        A zero-argument callable producing a new event loop.
+    """
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop
+
+    import uvloop
+
+    return uvloop.new_event_loop
 
 
 def start_metrics_server() -> None:
@@ -94,14 +118,13 @@ if __name__ == "__main__":
     setup_logging()
     logger.info("Starting deriver queue processor")
 
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     try:
         # Start Prometheus metrics server if enabled
         if settings.METRICS.ENABLED:
             start_metrics_server()
 
         logger.info("Running main loop")
-        asyncio.run(run_deriver())
+        asyncio.run(run_deriver(), loop_factory=loop_factory())
     except KeyboardInterrupt:
         logger.info("Shutdown initiated via KeyboardInterrupt")
     except Exception as e:
