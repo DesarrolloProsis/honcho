@@ -34,7 +34,7 @@ _LOCK_RETRY_DELAY_SECONDS = 0.1
 
 
 @contextmanager
-def _locked(f: IO[str]) -> Generator[bool, None, None]:
+def _locked(f: IO[str]) -> Generator[bool]:
     """Exclusively lock an open file for the duration of the block.
 
     Multiple processes (API server and deriver) append to the same traces file, so
