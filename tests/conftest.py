@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
@@ -170,6 +172,28 @@ def pytest_configure(config: pytest.Config) -> None:  # pyright: ignore[reportUn
     # Workers inherit the controller's env and would each redo this.
     if os.environ.get("PYTEST_XDIST_WORKER") is None:
         _sweep_stale_test_databases()
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
+    """Give pytest-asyncio a loop psycopg can actually use on Windows.
+
+    pytest-asyncio builds its loop from the asyncio policy, which defaults to
+    ProactorEventLoop on Windows. psycopg's async implementation cannot run on
+    it, so every database-backed async test fails at connection time with
+    InterfaceError -- 2219 errors out of 2832 tests before this fixture existed.
+
+    Overriding `event_loop_policy` is pytest-asyncio's documented hook. The
+    application code prefers `asyncio.run(..., loop_factory=...)` over the
+    deprecated policy API, but pytest-asyncio exposes no factory equivalent, so
+    the policy is the supported seam here.
+
+    Returns:
+        The selector-based policy on Windows, the default policy elsewhere.
+    """
+    if sys.platform == "win32":
+        return asyncio.WindowsSelectorEventLoopPolicy()
+    return asyncio.get_event_loop_policy()
 
 
 def _get_test_db_url(worker_id: str) -> URL:

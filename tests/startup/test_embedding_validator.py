@@ -198,6 +198,15 @@ def test_non_1536_pgvector_without_migrated_no_longer_raises_at_config_time() ->
         "PYTHON_DOTENV_DISABLED": "1",
         "EMBEDDING_VECTOR_DIMENSIONS": "768",
     }
+    if sys.platform == "win32":
+        # Winsock cannot initialize without SystemRoot, and importing asyncio
+        # pulls in _overlapped, which needs it. Omitting it fails the child with
+        # "OSError: [WinError 10106] The requested service provider could not be
+        # loaded or initialized" before any of this test's assertions are reached.
+        for key in ("SystemRoot", "SYSTEMROOT"):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
     # Use a subprocess so the global settings singleton in this test
     # process is not perturbed and is re-evaluated freshly in the child.
     snippet = (
