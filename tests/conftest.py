@@ -86,6 +86,8 @@ _RUNTIME_MOCK_TEST_BLOCKLIST_PREFIXES = (
     # LLM transport tests mock providers directly and don't need database/runtime setup.
     "tests/utils/test_length_finish_reason.py",
     "tests/utils/test_clients.py",
+    # File-locking tests fake the locking module directly; no database involved.
+    "tests/telemetry/test_reasoning_traces_lock.py",
     # Session-scope SQL shape — asserts on compiled statements, never executes one.
     "tests/crud/test_session_scope_clauses.py",
     # Pure JWT scope tests — operate on src.security directly, no DB needed.
