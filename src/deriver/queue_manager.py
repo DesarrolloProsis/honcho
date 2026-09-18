@@ -219,10 +219,17 @@ class QueueManager:
         # Set up signal handlers.
         # loop.add_signal_handler() is not implemented on Windows (it raises
         # NotImplementedError, whose str() is empty). Fall back to signal.signal(),
-        # which Windows does support for SIGINT/SIGTERM, so Ctrl+C and a service
-        # stop still trigger the same graceful shutdown path.
+        # which Windows does support for SIGINT/SIGTERM/SIGBREAK.
+        #
+        # What this does NOT cover on Windows: `Stop-ScheduledTask` and any other
+        # TerminateProcess-based stop. Windows does not deliver SIGTERM from an
+        # external process at all, so nothing below runs and the process dies
+        # where it stands. SIGBREAK is registered because CTRL_BREAK_EVENT is the
+        # one console control event that CAN be delivered to a detached process
+        # group from outside, which gives a supervisor a graceful option --
+        # see windows/Stop-HonchoService.ps1.
         loop = asyncio.get_running_loop()
-        signals = (signal.SIGTERM, signal.SIGINT)
+        signals: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
         if sys.platform != "win32":
             for sig in signals:
                 loop.add_signal_handler(
@@ -230,6 +237,7 @@ class QueueManager:
                 )
             logger.debug("Signal handlers registered")
         else:
+            signals = (*signals, signal.SIGBREAK)
 
             def _win_signal_handler(signum: int, _frame: object) -> None:
                 # Runs in the main thread outside the loop; hand off thread-safely.
