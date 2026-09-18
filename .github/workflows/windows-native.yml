@@ -1,0 +1,98 @@
+name: Windows Native
+
+# Guards the downstream Windows patch series. Upstream declined native Windows
+# support (plastic-labs/honcho#1075, #1076), so nothing upstream exercises these
+# paths -- without this job a rebase onto a new upstream tag could silently drop
+# a guard and the failure would only surface at deploy time.
+#
+# Deliberately no PostgreSQL service: every check here is about import-time and
+# event-loop behaviour, which needs no database. Database-backed tests stay on
+# the Linux jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      # Blocker 1: reasoning_traces imported fcntl at module scope, which does
+      # not exist on Windows, so importing it raised ModuleNotFoundError and
+      # took down anything that touched the LLM call path.
+      - name: trace locking imports on Windows
+        run: uv run python -c "from src.telemetry.reasoning_traces import _locked; print('reasoning_traces OK')"
+
+      # Blocker 4: __main__ imported uvloop unconditionally. uvloop is excluded
+      # from Windows installs by a lockfile marker, so `python -m src.deriver`
+      # died at import before its own logging could report why.
+      - name: deriver entry point imports without uvloop
+        run: uv run python -c "import src.deriver.__main__; print('deriver __main__ OK')"
+
+      - name: uvloop is genuinely absent (the guard is load-bearing)
+        run: uv run python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('uvloop') is None else 'uvloop present on Windows - the import guard is no longer exercised, re-check this job')"
+
+      # Blocker 3: psycopg cannot run on the ProactorEventLoop, and uvicorn
+      # builds its loop from its own factory, ignoring the asyncio policy.
+      - name: deriver selects the selector event loop
+        run: uv run python -c "import asyncio; from src.deriver.__main__ import loop_factory; f = loop_factory(); assert f is asyncio.SelectorEventLoop, f; print('loop_factory OK')"
+
+      - name: uvicorn still needs the launcher (pin the assumption)
+        run: uv run python -c "import asyncio; from uvicorn.config import Config; f = Config('src.main:app').get_loop_factory(); assert f is asyncio.ProactorEventLoop, f'uvicorn now returns {f} for a plain config - windows/run_api.py may be unnecessary, re-check it'; print('uvicorn assumption holds')"
+
+      # Also pins the security default: the launcher must bind localhost, since
+      # Honcho ships with AUTH_USE_AUTH=false and the v3 API allows conclusion
+      # read/write/delete with no credential.
+      - name: API launcher loads and defaults to localhost
+        run: uv run python -c "import importlib.util; spec = importlib.util.spec_from_file_location('run_api', 'windows/run_api.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); a = m.parse_args([]); assert (a.host, a.port) == ('127.0.0.1', 8000), (a.host, a.port); print('launcher OK, binds', a.host)"
+
+      - name: deterministic lock tests
+        run: uv run pytest tests/telemetry/test_reasoning_traces_lock.py -q -n 0
+
+      # The discriminating run: on Linux this passes even with the lock removed,
+      # because O_APPEND appends are atomic there. Only the Windows run proves
+      # the msvcrt byte-range lock is doing real work.
+      - name: trace lock under contention
+        run: uv run python trace_lock_concurrency.py --processes 6 --writes 40
+
+  # The patch series must not change Unix behaviour. The lock tests fake the
+  # platform, so they also assert the msvcrt branch stays correct when run here.
+  posix-no-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      - name: uvloop is still used on POSIX
+        run: uv run python -c "import uvloop; from src.deriver.__main__ import loop_factory; assert loop_factory() is uvloop.new_event_loop; print('POSIX still uses uvloop')"
+
+      - name: lock tests (exercises the faked msvcrt branch on Linux too)
+        run: uv run pytest tests/telemetry/test_reasoning_traces_lock.py -q -n 0
