@@ -1,3 +1,8 @@
+> **This is a modified version of [plastic-labs/honcho](https://github.com/plastic-labs/honcho).**
+> Modified since 2026-08-25 to add native Windows support, which upstream does not provide. The
+> changes are listed in [WINDOWS.md](WINDOWS.md). Everything else is upstream's work, unchanged,
+> and this fork is distributed under the same AGPL-3.0 licence.
+
 <!-- markdownlint-disable MD033 -->
 <div align="center">
   <a href="https://app.honcho.dev" target="_blank">
