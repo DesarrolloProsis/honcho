@@ -38,12 +38,15 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$HonchoDir = (Split-Path $PSScriptRoot -Parent),
+    [string]$HonchoDir,
     [switch]$Check,
     [string]$Tag
 )
 
 $ErrorActionPreference = 'Stop'
+# Defaulted here, not in param(): Windows PowerShell 5.1 leaves $PSScriptRoot
+# empty in the parameter defaults of an advanced script.
+if (-not $HonchoDir) { $HonchoDir = Split-Path $PSScriptRoot -Parent }
 Set-Location $HonchoDir
 
 function Info($m) { Write-Host "[*] $m" -ForegroundColor Cyan }

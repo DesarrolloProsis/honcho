@@ -48,11 +48,14 @@
 [CmdletBinding()]
 param(
     [string[]]$TaskName = @('Honcho API', 'Honcho Deriver'),
-    [string]$HonchoDir = (Split-Path $PSScriptRoot -Parent),
+    [string]$HonchoDir,
     [int]$GracePeriodSeconds = 15
 )
 
 $ErrorActionPreference = 'Stop'
+# Defaulted here, not in param(): Windows PowerShell 5.1 leaves $PSScriptRoot
+# empty in the parameter defaults of an advanced script.
+if (-not $HonchoDir) { $HonchoDir = Split-Path $PSScriptRoot -Parent }
 
 function Get-HonchoProcess {
     <#
