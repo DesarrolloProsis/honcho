@@ -145,6 +145,31 @@ def test_fallback_pattern_matches_the_real_llm_warning():
     assert hc.FALLBACK_PATTERN.search(SWITCH)
 
 
+HOLD = dt.timedelta(hours=6)
+
+
+def test_log_alert_is_held_through_quiet_windows():
+    hit = [hc.Result("fallback-active", False, "3 calls switched")]
+    quiet = [hc.Result("fallback-active", True, "no fallback use")]
+    results, last = hc.hold_log_alerts(hit, {}, T0, HOLD)
+    assert not results[0].ok
+    # a quiet 15-minute window inside the hold stays in alert, no flapping
+    results, last = hc.hold_log_alerts(quiet, last, T0 + dt.timedelta(minutes=15), HOLD)
+    assert not results[0].ok and "clears after" in results[0].detail
+    # after the hold with no new hits, it clears and forgets
+    results, last = hc.hold_log_alerts(quiet, last, T0 + dt.timedelta(hours=6), HOLD)
+    assert results[0].ok and last == {}
+
+
+def test_a_new_hit_restarts_the_hold():
+    hit = [hc.Result("summary-errors", False, "1 failed")]
+    quiet = [hc.Result("summary-errors", True, "none")]
+    _, last = hc.hold_log_alerts(hit, {}, T0, HOLD)
+    _, last = hc.hold_log_alerts(hit, last, T0 + dt.timedelta(hours=5), HOLD)
+    results, _ = hc.hold_log_alerts(quiet, last, T0 + dt.timedelta(hours=7), HOLD)
+    assert not results[0].ok  # only 2 h since the second hit
+
+
 def test_check_logs_classifies_each_pattern(tmp_path: Path):
     (tmp_path / "deriver.log").write_text(
         f"{SWITCH}\n"

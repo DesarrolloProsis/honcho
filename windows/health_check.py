@@ -70,6 +70,7 @@ REMINDER_INTERVAL = dt.timedelta(hours=24)
 PROBE_INTERVAL = dt.timedelta(hours=1)
 QUEUE_STUCK_AFTER = dt.timedelta(hours=2)
 EMBED_BACKLOG_AFTER = dt.timedelta(hours=1)
+LOG_ALERT_HOLD = dt.timedelta(hours=6)
 FALLBACK_PATTERN = re.compile(r"switching from .* to backup", re.IGNORECASE)
 # The summarizer catches a model failure, logs this, and skips saving the
 # summary; the queue item still counts as processed without error, so the
@@ -149,6 +150,36 @@ def decide_notifications(
             entry["notified"] = None
         state[r.id] = entry
     return state, notes
+
+
+def hold_log_alerts(
+    results: list[Result],
+    last_hit: dict[str, str],
+    now: dt.datetime,
+    hold: dt.timedelta,
+) -> tuple[list[Result], dict[str, str]]:
+    """Keep a log-based check in alert until ``hold`` passes with no new hits.
+
+    Log checks only see lines written since the last run, so on their own they
+    flip to "ok" in any quiet 15-minute window. During an ongoing outage with
+    sporadic traffic that would alternate alert and recovery all day, one
+    notification each time. A check recovers only after a quiet ``hold``.
+    """
+    held: list[Result] = []
+    new_last = dict(last_hit)
+    for r in results:
+        if not r.ok:
+            new_last[r.id] = now.isoformat()
+            held.append(r)
+            continue
+        seen = last_hit.get(r.id)
+        if seen is not None and now - dt.datetime.fromisoformat(seen) < hold:
+            detail = f"last seen {seen[:16]}Z; clears after {hold} quiet"
+            held.append(Result(r.id, False, detail))
+        else:
+            new_last.pop(r.id, None)
+            held.append(r)
+    return held, new_last
 
 
 def scan_log(
@@ -460,6 +491,9 @@ def run(install_dir: Path, api_url: str, force_probe: bool) -> dict[str, Any]:
             Result("database", False, f"health queries failed: {type(e).__name__}: {e}")
         )
     log_results, state["log_offsets"] = check_logs(logs, state.get("log_offsets", {}))
+    log_results, state["log_last_hit"] = hold_log_alerts(
+        log_results, state.get("log_last_hit", {}), now, LOG_ALERT_HOLD
+    )
     results.extend(log_results)
 
     last_probe = state.get("last_probe")
