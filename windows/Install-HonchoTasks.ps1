@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Register the Honcho API and deriver as logon-triggered Scheduled Tasks.
+    Register the Honcho API and deriver as logon-triggered Scheduled Tasks,
+    plus a weekly check for new upstream releases.
 
 .DESCRIPTION
     Honcho's only clients (agents, editors) are interactive, so the services are
@@ -8,7 +9,11 @@
     wide install location and a service principal with stored credentials; see
     WINDOWS.md for that trade-off.
 
-    Both tasks launch through windows\start-honcho-hidden.vbs so no console
+    "Honcho Upstream Check" runs Update-Honcho.ps1 -Check -Notify every Monday
+    and raises a desktop notification when a newer release tag exists. It only
+    reports; it never updates. Nothing else tells you a release happened.
+
+    All tasks launch through windows\start-honcho-hidden.vbs so no console
     window appears on the desktop.
 
 .PARAMETER HonchoDir
@@ -41,7 +46,9 @@
 
       RestartCount 3          Only fires when the process exits non-zero, which
                               is why the deriver was changed to do so on a fatal
-                              error instead of exiting 0.
+                              error instead of exiting 0. NOT set on the upstream
+                              check: it exits 2 to mean "update available", and
+                              a restart would repeat the notification.
 
     Health is read from the RESULT code, not the state alone:
       0x41301 = currently running (healthy)
@@ -62,11 +69,27 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $tasks = @(
-    @{ Name = 'Honcho API';     Component = 'api' },
-    @{ Name = 'Honcho Deriver'; Component = 'deriver' }
+    @{ Name = 'Honcho API';            Component = 'api';     Service = $true },
+    @{ Name = 'Honcho Deriver';        Component = 'deriver'; Service = $true },
+    @{ Name = 'Honcho Upstream Check'; Component = 'check';   Service = $false }
 )
 
+function Stop-ExistingService {
+    <#
+        Stop-ScheduledTask alone orphans the running python processes, and the
+        re-registered task would then start a SECOND deriver beside them. Use the
+        verified stop, and refuse to continue if anything survives.
+    #>
+    $existing = @($tasks | Where-Object {
+        $_.Service -and (Get-ScheduledTask -TaskName $_.Name -ErrorAction SilentlyContinue)
+    })
+    if ($existing.Count -eq 0) { return }
+    & (Join-Path $PSScriptRoot 'Stop-HonchoService.ps1') -HonchoDir $HonchoDir
+    if ($LASTEXITCODE -ne 0) { throw "services did not stop cleanly; refusing to re-register" }
+}
+
 if ($Unregister) {
+    Stop-ExistingService
     foreach ($t in $tasks) {
         if (Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
@@ -86,27 +109,39 @@ New-Item -ItemType Directory -Force -Path (Join-Path $HonchoDir 'logs') | Out-Nu
 
 Write-Host "[*] install dir: $HonchoDir" -ForegroundColor Cyan
 
+Stop-ExistingService
+
 foreach ($t in $tasks) {
     $action = New-ScheduledTaskAction `
         -Execute "$env:SystemRoot\System32\wscript.exe" `
         -Argument ('"{0}" {1}' -f $launcher, $t.Component) `
         -WorkingDirectory $HonchoDir
 
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType Interactive `
         -RunLevel Limited
 
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 1) `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit ([TimeSpan]::Zero)
+    if ($t.Service) {
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit ([TimeSpan]::Zero)
+    } else {
+        # StartWhenAvailable: a Monday spent logged off runs at the next logon.
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00'
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    }
 
     if (Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
@@ -121,7 +156,10 @@ foreach ($t in $tasks) {
 }
 
 Write-Host "`nStarting..." -ForegroundColor Cyan
-foreach ($t in $tasks) { Start-ScheduledTask -TaskName $t.Name; Start-Sleep -Seconds 3 }
+foreach ($t in $tasks | Where-Object { $_.Service }) {
+    Start-ScheduledTask -TaskName $t.Name
+    Start-Sleep -Seconds 3
+}
 Start-Sleep -Seconds 10
 
 Get-ScheduledTask -TaskName 'Honcho*' | ForEach-Object {
