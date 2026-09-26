@@ -66,7 +66,22 @@ $tasks = @(
     @{ Name = 'Honcho Deriver'; Component = 'deriver' }
 )
 
+function Stop-ExistingService {
+    <#
+        Stop-ScheduledTask alone orphans the running python processes, and the
+        re-registered task would then start a SECOND deriver beside them. Use the
+        verified stop, and refuse to continue if anything survives.
+    #>
+    $existing = @($tasks | Where-Object {
+        Get-ScheduledTask -TaskName $_.Name -ErrorAction SilentlyContinue
+    })
+    if ($existing.Count -eq 0) { return }
+    & (Join-Path $PSScriptRoot 'Stop-HonchoService.ps1') -HonchoDir $HonchoDir
+    if ($LASTEXITCODE -ne 0) { throw "services did not stop cleanly; refusing to re-register" }
+}
+
 if ($Unregister) {
+    Stop-ExistingService
     foreach ($t in $tasks) {
         if (Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
@@ -85,6 +100,8 @@ if (-not (Test-Path (Join-Path $HonchoDir '.venv\Scripts\python.exe'))) {
 New-Item -ItemType Directory -Force -Path (Join-Path $HonchoDir 'logs') | Out-Null
 
 Write-Host "[*] install dir: $HonchoDir" -ForegroundColor Cyan
+
+Stop-ExistingService
 
 foreach ($t in $tasks) {
     $action = New-ScheduledTaskAction `
