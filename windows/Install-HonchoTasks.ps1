@@ -71,9 +71,9 @@ $tasks = @(
 
 function Stop-ExistingService {
     <#
-        Stop-ScheduledTask alone orphans the running python processes, and the
-        re-registered task would then start a SECOND deriver beside them. Use the
-        verified stop, and refuse to continue if anything survives.
+        Stop-ScheduledTask alone orphans the running python processes, which
+        would keep running after their task is gone. Use the verified stop, and
+        refuse to continue if anything survives.
     #>
     $existing = @($tasks | Where-Object {
         Get-ScheduledTask -TaskName $_.Name -ErrorAction SilentlyContinue
@@ -104,8 +104,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $HonchoDir 'logs') | Out-Nu
 
 Write-Host "[*] install dir: $HonchoDir" -ForegroundColor Cyan
 
-Stop-ExistingService
-
+# Existing tasks are updated in place with -Force rather than unregistered and
+# re-created. Changing a definition does not touch a running instance, so the
+# services need no stop here: no downtime, and no orphaned deriver (see
+# Stop-HonchoService.ps1). The new definition applies from the next start.
 foreach ($t in $tasks) {
     $action = New-ScheduledTaskAction `
         -Execute "$env:SystemRoot\System32\wscript.exe" `
@@ -128,20 +130,34 @@ foreach ($t in $tasks) {
         -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
 
-    if (Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false
+    $description = 'Honcho self-hosted memory service'
+    $existed = [bool](Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue)
+
+    try {
+        Register-ScheduledTask -TaskName $t.Name -Force `
+            -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+            -Description $description -ErrorAction Stop | Out-Null
+        Write-Host "[OK] $(if ($existed) { 'updated' } else { 'registered' }) '$($t.Name)'" -ForegroundColor Green
+    } catch {
+        # A task registered from an elevated shell can be started and stopped by
+        # its user but not modified. Keep it rather than fail the whole install.
+        if (-not $existed) { throw }
+        Write-Host "[!] kept existing '$($t.Name)': $($_.Exception.Message.Trim())" -ForegroundColor Yellow
+        Write-Host "    It was probably registered elevated. Re-run this script elevated to update it." -ForegroundColor Yellow
     }
-
-    Register-ScheduledTask -TaskName $t.Name `
-        -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-        -Description 'Honcho self-hosted memory service' | Out-Null
-
-    Write-Host "[OK] registered '$($t.Name)'" -ForegroundColor Green
 }
 
 Write-Host "`nStarting..." -ForegroundColor Cyan
-foreach ($t in $tasks) { Start-ScheduledTask -TaskName $t.Name; Start-Sleep -Seconds 3 }
+foreach ($t in $tasks) {
+    # Starting a task that is already running is refused under IgnoreNew and
+    # overwrites LastTaskResult with 0x800710E0, hiding the 0x41301 health code.
+    if ((Get-ScheduledTask -TaskName $t.Name).State -eq 'Running') {
+        Write-Host "    '$($t.Name)' already running"
+        continue
+    }
+    Start-ScheduledTask -TaskName $t.Name
+    Start-Sleep -Seconds 3
+}
 Start-Sleep -Seconds 10
 
 Get-ScheduledTask -TaskName 'Honcho*' | ForEach-Object {
