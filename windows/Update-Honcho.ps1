@@ -20,6 +20,17 @@
 .PARAMETER Tag
     Rebase onto this tag instead of the newest one.
 
+.PARAMETER Notify
+    Also raise a desktop notification when a newer tag exists or the run
+    fails. Meant for the weekly "Honcho Upstream Check" task, where nobody is
+    watching the console. Needs Windows PowerShell 5.1 (WinRT); under
+    PowerShell 7 the notification is skipped and only the log line remains.
+
+.OUTPUTS
+    Exit codes: 0 = up to date (or update applied), 1 = failure,
+    2 = -Check found a newer release tag. 2 is deliberately not 0 so a
+    scheduler or wrapper can tell "nothing to do" from "action needed".
+
 .NOTES
     Fail-closed by design. In PowerShell, $ErrorActionPreference = 'Stop' does
     NOT make a non-zero exit from a native command (git, uv, alembic) a
@@ -35,16 +46,43 @@
 param(
     [string]$HonchoDir = (Split-Path $PSScriptRoot -Parent),
     [switch]$Check,
-    [string]$Tag
+    [string]$Tag,
+    [switch]$Notify
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location $HonchoDir
 
+function Send-Notice {
+    <# Best-effort desktop toast when -Notify is set. Never fails the run. #>
+    param([string]$Title, [string]$Text)
+    if (-not $Notify) { return }
+    try {
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+            [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+        $lines = $xml.GetElementsByTagName('text')
+        $null = $lines.Item(0).AppendChild($xml.CreateTextNode($Title))
+        $null = $lines.Item(1).AppendChild($xml.CreateTextNode($Text))
+        # powershell.exe's own AppUserModelID, so no app registration is needed.
+        $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show(
+            [Windows.UI.Notifications.ToastNotification]::new($xml))
+    } catch {
+        Write-Host "[!] could not raise a notification: $($_.Exception.Message)"
+    }
+}
+
 function Info($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m"  -ForegroundColor Yellow }
-function Die($m)  { Write-Host "[X] $m"  -ForegroundColor Red; exit 1 }
+function Die($m)  {
+    Write-Host "[X] $m" -ForegroundColor Red
+    Send-Notice 'Honcho update check failed' "$m See logs\upstream-check.log."
+    exit 1
+}
+
+Info ("run at {0:yyyy-MM-dd HH:mm:ss zzz} in {1}" -f (Get-Date), $HonchoDir)
 
 function Invoke-Checked {
     <# Run a native command and abort unless it exits 0. #>
@@ -130,7 +168,11 @@ foreach ($c in $checks) {
     }
 }
 
-if ($Check) { Info "check-only mode, stopping here."; exit 0 }
+if ($Check) {
+    Info "check-only mode, stopping here."
+    Send-Notice "Honcho $Tag is available" "The fork is based on $base. Run windows\Update-Honcho.ps1 -Check for details."
+    exit 2
+}
 
 # --- 5. safety net -----------------------------------------------------------
 $backupTag = "pre-update-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss')

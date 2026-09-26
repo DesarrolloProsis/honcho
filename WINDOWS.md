@@ -128,7 +128,9 @@ uv run python -m src.deriver         # deriver, separate terminal
 ```
 
 Registers both as logon-triggered Scheduled Tasks, launched through
-`windows\start-honcho-hidden.vbs` so no console window appears.
+`windows\start-honcho-hidden.vbs` so no console window appears. It also registers
+**Honcho Upstream Check**, which runs every Monday and raises a desktop notification when a
+newer upstream release tag exists (see [Staying current](#staying-current)).
 
 **Stop them with `.\windows\Stop-HonchoService.ps1` — never `Stop-ScheduledTask` alone.**
 See [Stopping the service](#stopping-the-service).
@@ -262,6 +264,18 @@ git fetch upstream --tags
 git log --oneline $(git describe --tags --abbrev=0)..upstream/main   # what's new
 ```
 
+Or let the updater report it, including whether the release changes migrations or the Python
+floor and whether upstream has fixed any Windows blocker natively. It makes no changes:
+
+```powershell
+.\windows\Update-Honcho.ps1 -Check     # exit 0 = up to date, 2 = newer tag, 1 = error
+```
+
+Nothing else tells you a release happened, so the **Honcho Upstream Check** task runs this every
+Monday with `-Notify` and logs to `logs\upstream-check.log`. A notification means "a release
+exists", not "update now"; the check never changes anything. A failed check notifies too, so a
+broken check does not go quiet.
+
 To see the current patch series and its base:
 
 ```powershell
@@ -310,7 +324,8 @@ lingering unexamined.
 |---|---|
 | `run_api.py` | API entry point on the selector event loop (blocker 3) |
 | `start-honcho-hidden.vbs` | Console-free launcher for Scheduled Tasks |
-| `Install-HonchoTasks.ps1` | Register/unregister both services |
+| `Install-HonchoTasks.ps1` | Register/unregister both services and the weekly upstream check |
 | `Stop-HonchoService.ps1` | Stop them **and verify** they actually stopped |
+| `Update-Honcho.ps1` | `-Check` reports a newer release tag; without it, rebases onto the tag |
 
 Every script defaults its install directory to its own location, so a clone works unedited.

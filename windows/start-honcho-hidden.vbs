@@ -7,6 +7,11 @@
 ' Usage (from a Scheduled Task action):
 '     wscript.exe "<install>\windows\start-honcho-hidden.vbs" api
 '     wscript.exe "<install>\windows\start-honcho-hidden.vbs" deriver
+'     wscript.exe "<install>\windows\start-honcho-hidden.vbs" check
+'
+' "check" runs windows\Update-Honcho.ps1 -Check -Notify under Windows
+' PowerShell 5.1, which is always present and is the host that can raise a
+' desktop notification. Its exit code (2 = newer release tag) is passed through.
 '
 ' Paths are derived from this script's own location, so the install directory
 ' can be anywhere and nothing here needs editing. Do NOT hardcode a profile
@@ -27,6 +32,7 @@
 Option Explicit
 
 Dim shell, fso, component, scriptDir, honchoDir, pythonExe, target, logFile, command, exitCode, q
+Dim psExe
 q = Chr(34)
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -44,13 +50,21 @@ If component = "api" Then
     target = q & fso.BuildPath(honchoDir, "windows\run_api.py") & q
 ElseIf component = "deriver" Then
     target = "-m src.deriver"
+ElseIf component = "check" Then
+    psExe = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+    target = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & _
+             q & fso.BuildPath(scriptDir, "Update-Honcho.ps1") & q & " -Check -Notify"
 Else
     WScript.Quit 2
 End If
 
-logFile = fso.BuildPath(honchoDir, "logs\" & component & ".log")
+If component = "check" Then
+    logFile = fso.BuildPath(honchoDir, "logs\upstream-check.log")
+Else
+    logFile = fso.BuildPath(honchoDir, "logs\" & component & ".log")
+    If Not fso.FileExists(pythonExe) Then WScript.Quit 3
+End If
 
-If Not fso.FileExists(pythonExe) Then WScript.Quit 3
 If Not fso.FolderExists(fso.BuildPath(honchoDir, "logs")) Then
     fso.CreateFolder fso.BuildPath(honchoDir, "logs")
 End If
@@ -64,8 +78,13 @@ shell.CurrentDirectory = honchoDir
 ' -u keeps stdout unbuffered so the log stays current and survives a kill.
 ' 2>&1 is essential, not optional: logging.basicConfig writes to stderr, so
 ' redirecting stdout alone still discards every log line.
-command = "cmd.exe /c " & q & q & pythonExe & q & " -u " & target & _
-          " >> " & q & logFile & q & " 2>&1" & q
+If component = "check" Then
+    command = "cmd.exe /c " & q & q & psExe & q & " " & target & _
+              " >> " & q & logFile & q & " 2>&1" & q
+Else
+    command = "cmd.exe /c " & q & q & pythonExe & q & " -u " & target & _
+              " >> " & q & logFile & q & " 2>&1" & q
+End If
 
 exitCode = shell.Run(command, 0, True)
 WScript.Quit exitCode
