@@ -24,7 +24,9 @@ no messages are flowing:
                     the last margin before the next outage.
     summary-errors  a session summary failed; the summarizer skips it and the
                     queue records success, so only the log shows it
-    probe:*         one tiny call to each configured endpoint, hourly
+    probe:*         one tiny call to each configured endpoint, hourly. Embedding
+                    endpoints must also reproduce a stored conclusion's
+                    vector (cosine > 0.99), proving the same model
 
 A notification is raised when a check changes state (alert or recovery), plus
 a daily reminder while it stays in alert, so a persistent problem is neither
@@ -285,39 +287,42 @@ def configured_endpoints() -> list[dict[str, Any]]:
         settings.DREAM.DEDUCTION_MODEL_CONFIG,
         settings.DREAM.INDUCTION_MODEL_CONFIG,
     ]
+
+    def chat(model: str, transport: str, base_url: str | None, key: str | None):
+        # Resolve exactly as src/llm/registry.py client_for_model_config does:
+        # a config without its own key uses the transport's global key, and
+        # one without a base URL uses the global base URL. Probing with
+        # anything else would test a client Honcho never builds.
+        if transport == "openai":
+            key = key or settings.LLM.OPENAI_API_KEY
+            base_url = base_url or settings.LLM.OPENAI_BASE_URL
+        return {
+            "kind": "chat",
+            "transport": transport,
+            "model": model,
+            "base_url": base_url,
+            "api_key": key,
+        }
+
     raw: list[dict[str, Any]] = []
     emb = resolve_embedding_model_config(settings.EMBEDDING.MODEL_CONFIG)
-    raw.append(
-        {
-            "kind": "embedding",
-            "transport": emb.transport,
-            "model": emb.model,
-            "base_url": emb.base_url,
-            "api_key": emb.api_key,
-        }
-    )
-    for c in configured:
-        mc = resolve_model_config(c)
-        raw.append(
-            {
-                "kind": "chat",
-                "transport": mc.transport,
-                "model": mc.model,
-                "base_url": mc.base_url,
-                "api_key": mc.api_key,
-            }
-        )
-        if mc.fallback is not None:
-            fb = mc.fallback
+    for e in (emb, emb.fallback):
+        if e is not None:
             raw.append(
                 {
-                    "kind": "chat",
-                    "transport": fb.transport,
-                    "model": fb.model,
-                    "base_url": fb.base_url,
-                    "api_key": fb.api_key,
+                    "kind": "embedding",
+                    "transport": e.transport,
+                    "model": e.model,
+                    "base_url": e.base_url,
+                    "api_key": e.api_key,
                 }
             )
+    for c in configured:
+        mc = resolve_model_config(c)
+        raw.append(chat(mc.model, mc.transport, mc.base_url, mc.api_key))
+        if mc.fallback is not None:
+            fb = mc.fallback
+            raw.append(chat(fb.model, fb.transport, fb.base_url, fb.api_key))
 
     seen: set[tuple[Any, ...]] = set()
     out: list[dict[str, Any]] = []
@@ -333,23 +338,88 @@ def configured_endpoints() -> list[dict[str, Any]]:
     return out
 
 
-def probe(endpoint: dict[str, Any]) -> Result:
-    """One minimal call. Auth, missing deployment, and connection errors fail it."""
+def reference_vector() -> tuple[str, list[float]] | None:
+    """One stored conclusion and its vector, to prove an embedding endpoint's identity."""
+    from sqlalchemy import create_engine, text
+
+    from src.config import settings
+
+    engine = create_engine(settings.DB.CONNECTION_URI, pool_pre_ping=True)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            row = conn.execute(
+                text("""
+                    select content, embedding::text from documents
+                    where sync_state = 'synced' and deleted_at is null
+                      and embedding is not null and length(content) between 80 and 400
+                    order by id limit 1
+                """)
+            ).first()
+            conn.rollback()
+    finally:
+        engine.dispose()
+    if row is None:
+        return None
+    return str(row[0]), [float(x) for x in str(row[1]).strip("[]").split(",")]
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    return dot / ((sum(x * x for x in a) ** 0.5) * (sum(y * y for y in b) ** 0.5))
+
+
+def probe(
+    endpoint: dict[str, Any], reference: tuple[str, list[float]] | None = None
+) -> Result:
+    """One minimal call. Auth, missing deployment, and connection errors fail it.
+
+    An embedding endpoint is also checked for IDENTITY: it embeds a stored
+    conclusion and must reproduce the stored vector (cosine > 0.99). A
+    different model behind the same name would otherwise write vectors from
+    another space into the index, silently breaking search.
+    """
     import openai
 
     if endpoint["transport"] != "openai":
         return Result(
             endpoint["id"], True, f"skipped: transport {endpoint['transport']}"
         )
+    if not endpoint["api_key"]:
+        return Result(
+            endpoint["id"], False, f"{endpoint['model']}: no API key configured"
+        )
     client = openai.OpenAI(
-        api_key=endpoint["api_key"] or "missing",
+        api_key=endpoint["api_key"],
         base_url=endpoint["base_url"],
         timeout=30,
         max_retries=0,
     )
     try:
         if endpoint["kind"] == "embedding":
-            client.embeddings.create(model=endpoint["model"], input="health check")
+            text_in = reference[0] if reference else "health check"
+            resp = client.embeddings.create(
+                model=endpoint["model"], input=text_in, encoding_format="float"
+            )
+            if reference is not None:
+                fresh = list(resp.data[0].embedding)
+                model = endpoint["model"]
+                if len(fresh) != len(reference[1]):
+                    detail = f"{model} returned {len(fresh)} dims, index has {len(reference[1])}"
+                    return Result(endpoint["id"], False, detail + ": different model")
+                sim = cosine(fresh, reference[1])
+                if sim < 0.99:
+                    detail = (
+                        f"{model} vectors do not match the index (cosine {sim:.4f})"
+                    )
+                    return Result(
+                        endpoint["id"],
+                        False,
+                        detail + ": different model behind this name",
+                    )
+                return Result(
+                    endpoint["id"], True, f"responding, same vector space ({sim:.6f})"
+                )
         else:
             client.chat.completions.create(
                 model=endpoint["model"],
@@ -399,7 +469,14 @@ def run(install_dir: Path, api_url: str, force_probe: bool) -> dict[str, Any]:
         or (now - dt.datetime.fromisoformat(last_probe) >= PROBE_INTERVAL)
     )
     if due:
-        probes = [probe(e) for e in configured_endpoints()]
+        endpoints = configured_endpoints()
+        reference = None
+        if any(e["kind"] == "embedding" for e in endpoints):
+            try:
+                reference = reference_vector()
+            except Exception as e:  # noqa: BLE001 - probes still run, just without identity
+                print(f"[!] no reference vector for the identity probe: {e}")
+        probes = [probe(e, reference) for e in endpoints]
         state["probe_results"] = [r.__dict__ for r in probes]
         state["last_probe"] = now.isoformat()
     else:
