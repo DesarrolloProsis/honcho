@@ -176,6 +176,44 @@ probe times) to `logs\health-state.json`. Delete the state file to re-announce e
 The check always reports on the install it lives in: `src.config` locates `.env` relative to the
 code, so a copy in a dev checkout reads the dev settings and database, not the live ones.
 
+### Backup model endpoints
+
+Monitoring tells you about an outage; a fallback rides through it. Honcho accepts one fallback per
+model config, used on the **final** retry of each call. With a dead primary that means two failed
+attempts plus backoff (about 12 s) before the fallback answers; a tool loop stays on the fallback
+once it switches, so a chat pays that once.
+
+```ini
+# .env, repeated for DERIVER_, SUMMARY_, each DIALECTIC_LEVELS__<level>__ and both DREAM_*_ configs
+DERIVER_MODEL_CONFIG__FALLBACK__MODEL=<deployment>
+DERIVER_MODEL_CONFIG__FALLBACK__TRANSPORT=openai
+DERIVER_MODEL_CONFIG__FALLBACK__OVERRIDES__BASE_URL=https://<backup-endpoint>/openai/v1
+DERIVER_MODEL_CONFIG__FALLBACK__OVERRIDES__API_KEY_ENV=LLM_BACKUP_API_KEY
+LLM_BACKUP_API_KEY=<key>
+
+# Embeddings (this fork): the fallback MUST serve the same model, or startup fails.
+EMBEDDING_MODEL_CONFIG__FALLBACK__MODEL=text-embedding-3-small
+EMBEDDING_MODEL_CONFIG__FALLBACK__OVERRIDES__BASE_URL=https://<backup-endpoint>/openai/v1
+EMBEDDING_MODEL_CONFIG__FALLBACK__OVERRIDES__API_KEY_ENV=LLM_BACKUP_API_KEY
+```
+
+Before relying on a backup:
+
+- **Read its rate limits**, not just whether it answers: the `x-ratelimit-limit-tokens` response
+  header. A deriver batch can be 25,000 input tokens; a deployment capped at 10,000 tokens per
+  minute answers a probe and then fails every real call with 429.
+- **Test the model with Honcho's real agents**, not a chat probe: structured output for the
+  deriver, tool calls for the dialectic and dreamer. `tests/live_llm` covers the backend layer
+  (`LIVE_LLM_OPENAI_GPT4_MODELS=<deployment>`, `--live-llm`); then run a deriver batch and a chat
+  against a dev database with the primary disabled. Some OpenAI-compatible stacks refuse a forced
+  `tool_choice` combined with `response_format`, so keep `DIALECTIC_LEVELS__*__TOOL_CHOICE` unset
+  when such a model is a fallback.
+- **An embedding backup must be the same model.** The health check proves it hourly by
+  re-embedding a stored conclusion and comparing with the stored vector.
+
+The health check's `fallback-active` alert fires whenever a call uses a fallback: a backup that
+quietly carries production is the next silent outage.
+
 ---
 
 ## Security: the localhost bind is not optional
