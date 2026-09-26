@@ -170,6 +170,98 @@ def test_a_new_hit_restarts_the_hold():
     assert not results[0].ok  # only 2 h since the second hit
 
 
+# --- personal-kb watch --------------------------------------------------------
+
+# The exact shapes personal-kb writes: failover.py's switch line and refresh.cmd's
+# done line, whose %time% pads the hour with a space.
+KB_SWITCH = (
+    "2026-09-26T13:29:14-06:00 embedding: primary a.example (text-embedding-3-small) "
+    "failed with AuthenticationError 401; switching to backup b.example (text-embedding-3-small)"
+)
+
+
+def _refresh_log(tmp_path: Path, *lines: str) -> Path:
+    log = tmp_path / "refresh.log"
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return log
+
+
+def _local(y: int, mo: int, d: int, h: int, mi: int) -> dt.datetime:
+    return dt.datetime(y, mo, d, h, mi).astimezone()
+
+
+def test_kb_dir_is_off_unless_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(hc.KB_DIR_SETTING, raising=False)
+    assert hc.kb_dir(tmp_path) is None
+    (tmp_path / ".env").write_text("OTHER=1\n", encoding="utf-8")
+    assert hc.kb_dir(tmp_path) is None
+
+
+def test_kb_dir_reads_the_install_env_and_the_environment_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv(hc.KB_DIR_SETTING, raising=False)
+    (tmp_path / ".env").write_text('HEALTH_KB_DIR="E:/kb"\n', encoding="utf-8")
+    assert hc.kb_dir(tmp_path) == Path("E:/kb")
+    monkeypatch.setenv(hc.KB_DIR_SETTING, "F:/other")
+    assert hc.kb_dir(tmp_path) == Path("F:/other")
+
+
+def test_kb_fallback_matches_the_real_switch_line(tmp_path: Path):
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "fallback.log").write_text(f"{KB_SWITCH}\n{KB_SWITCH}\n", encoding="utf-8")
+    result, offset = hc.check_kb_fallback(tmp_path, 0)
+    assert not result.ok and result.detail.startswith("personal-kb: 2 call(s)")
+    result, _ = hc.check_kb_fallback(tmp_path, offset)
+    assert result.ok
+
+
+def test_kb_fallback_absent_log_is_clean(tmp_path: Path):
+    result, offset = hc.check_kb_fallback(tmp_path, 0)
+    assert result.ok and offset == 0
+
+
+def test_kb_refresh_ok_uses_the_last_done_line(tmp_path: Path):
+    log = _refresh_log(
+        tmp_path,
+        "[2026-09-26  7:00:09.98] refresh done (exit 1) ",
+        "[2026-09-26 13:29:29.59] refresh start ",
+        "[2026-09-26 13:29:37.40] refresh done (exit 0) ",
+        '{"curation_debt": {}}',
+    )
+    result = hc.check_kb_refresh(log, _local(2026, 9, 26, 14, 0))
+    assert result.ok, result.detail
+
+
+def test_kb_refresh_alerts_on_a_failed_run(tmp_path: Path):
+    log = _refresh_log(tmp_path, "[2026-09-26  7:00:09.98] refresh done (exit 1) ")
+    result = hc.check_kb_refresh(log, _local(2026, 9, 26, 7, 15))
+    assert not result.ok and "exited 1" in result.detail
+
+
+def test_kb_refresh_alerts_when_the_daily_task_stops(tmp_path: Path):
+    log = _refresh_log(tmp_path, "[2026-09-24  7:00:07.36] refresh done (exit 0) ")
+    result = hc.check_kb_refresh(log, _local(2026, 9, 26, 7, 30))
+    assert not result.ok and "may not be running" in result.detail
+    # 25 h is inside the window: one late or skipped-by-a-minute run is not an alert
+    assert hc.check_kb_refresh(log, _local(2026, 9, 25, 8, 0)).ok
+
+
+def test_kb_refresh_unreadable_date_is_not_a_false_alarm(tmp_path: Path):
+    # A non-ISO %date% locale: the exit code still counts, the age is skipped.
+    log = _refresh_log(tmp_path, "[Sat 09/26/2026  7:00:02.77] refresh done (exit 0) ")
+    assert hc.check_kb_refresh(log, _local(2027, 1, 1, 0, 0)).ok
+    log = _refresh_log(tmp_path, "[Sat 09/26/2026  7:00:02.77] refresh done (exit 2) ")
+    assert not hc.check_kb_refresh(log, _local(2026, 9, 26, 8, 0)).ok
+
+
+def test_kb_refresh_missing_or_empty_log_alerts(tmp_path: Path):
+    assert not hc.check_kb_refresh(tmp_path / "refresh.log", _local(2026, 9, 26, 8, 0)).ok
+    log = _refresh_log(tmp_path, "[2026-09-26  7:00:02.77] refresh start ")
+    result = hc.check_kb_refresh(log, _local(2026, 9, 26, 8, 0))
+    assert not result.ok and "no finished refresh" in result.detail
+
+
 def test_check_logs_classifies_each_pattern(tmp_path: Path):
     (tmp_path / "deriver.log").write_text(
         f"{SWITCH}\n"

@@ -28,6 +28,15 @@ no messages are flowing:
                     endpoints must also reproduce a stored conclusion's
                     vector (cosine > 0.99), proving the same model
 
+Optional, when ``HEALTH_KB_DIR`` names a personal-kb checkout (environment or
+this install's ``.env``). That KB mirrors Honcho's conclusions over the same
+model endpoints and has its own fallback, so an outage reaches it too:
+
+    kb-fallback     the KB switched a call to its backup since the last run
+                    (its logs\\fallback.log), held like fallback-active
+    kb-refresh      its last daily refresh exited non-zero, or none has
+                    finished in 26 hours (its logs\\refresh.log)
+
 A notification is raised when a check changes state (alert or recovery), plus
 a daily reminder while it stays in alert, so a persistent problem is neither
 silent nor spammed every 15 minutes.
@@ -50,6 +59,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import sys
 import traceback
@@ -77,6 +87,16 @@ FALLBACK_PATTERN = re.compile(r"switching from .* to backup", re.IGNORECASE)
 # log line is the only trace. (src/utils/summarizer.py, _create_summary)
 SUMMARY_ERROR_PATTERN = re.compile(r"Error generating summary")
 LOG_FILES = ("api.log", "deriver.log")
+KB_DIR_SETTING = "HEALTH_KB_DIR"
+# personal-kb's failover.py writes "...; switching to backup <host> (<model>)".
+KB_FALLBACK_PATTERN = re.compile(r"switching to backup", re.IGNORECASE)
+# refresh.cmd writes "[%date% %time%] refresh done (exit N)". %date% follows the
+# Windows locale, so the stamp is parsed separately and only when it is ISO; an
+# unreadable stamp skips the staleness test rather than raising a false alarm.
+# %time% pads the hour with a space before 10:00.
+KB_REFRESH_DONE = re.compile(r"^\[([^\]]*)\] refresh done \(exit (-?\d+)\)")
+KB_REFRESH_STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})")
+KB_REFRESH_STALE_AFTER = dt.timedelta(hours=26)
 # check id -> (pattern, message when it matched since the last run, message when clean)
 LOG_CHECKS: dict[str, tuple[re.Pattern[str], str, str]] = {
     "fallback-active": (
@@ -303,6 +323,74 @@ def check_logs(
     return results, new_offsets
 
 
+def kb_dir(install_dir: Path) -> Path | None:
+    """The personal-kb checkout to watch, or None when not configured.
+
+    Read from the environment first, then from this install's ``.env``, where
+    the rest of its settings live. The scheduled task inherits no shell, so the
+    ``.env`` is the reliable place for it.
+    """
+    value = os.environ.get(KB_DIR_SETTING)
+    env_file = install_dir / ".env"
+    if not value and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, raw = line.strip().partition("=")
+            if sep and key.strip() == KB_DIR_SETTING:
+                value = raw.strip().strip('"').strip("'")
+    return Path(value) if value else None
+
+
+def check_kb_fallback(kb: Path, offset: int) -> tuple[Result, int]:
+    """personal-kb calls that switched to its backup endpoint since ``offset``."""
+    hits, new_offset = scan_log(kb / "logs" / "fallback.log", offset, KB_FALLBACK_PATTERN)
+    n = len(hits)
+    detail = (
+        f"personal-kb: {n} call(s) switched to the backup since the last check; "
+        "its primary is failing"
+        if n
+        else "personal-kb: no fallback use"
+    )
+    return Result("kb-fallback", n == 0, detail), new_offset
+
+
+def check_kb_refresh(log: Path, now: dt.datetime) -> Result:
+    """The outcome and age of personal-kb's last finished daily refresh."""
+    if not log.exists():
+        return Result("kb-refresh", False, f"personal-kb: no refresh log at {log}")
+    with log.open("rb") as f:
+        f.seek(max(0, log.stat().st_size - 65536))
+        tail = f.read().decode("utf-8", errors="replace")
+    last = None
+    for line in tail.splitlines():
+        m = KB_REFRESH_DONE.match(line)
+        if m:
+            last = m
+    if last is None:
+        return Result("kb-refresh", False, "personal-kb: no finished refresh in its log")
+    stamp, code = last.group(1).strip(), int(last.group(2))
+    if code != 0:
+        return Result(
+            "kb-refresh",
+            False,
+            f"personal-kb: the refresh at {stamp} exited {code}; see its logs\\refresh.log",
+        )
+    s = KB_REFRESH_STAMP.match(stamp)
+    if s:
+        local = dt.datetime.strptime(
+            f"{s.group(1)} {int(s.group(2)):02d}:{s.group(3)}:{s.group(4)}",
+            "%Y-%m-%d %H:%M:%S",
+        ).astimezone()  # refresh.cmd stamps local time
+        age = now - local
+        if age > KB_REFRESH_STALE_AFTER:
+            return Result(
+                "kb-refresh",
+                False,
+                f"personal-kb: last refresh finished {age.total_seconds() / 3600:.0f} h ago; "
+                "its daily task may not be running",
+            )
+    return Result("kb-refresh", True, f"personal-kb: last refresh {stamp} ok")
+
+
 def configured_endpoints() -> list[dict[str, Any]]:
     """Every distinct (kind, transport, model, base_url, key) Honcho is configured to use."""
     from src.config import (
@@ -490,11 +578,22 @@ def run(install_dir: Path, api_url: str, force_probe: bool) -> dict[str, Any]:
         results.append(
             Result("database", False, f"health queries failed: {type(e).__name__}: {e}")
         )
-    log_results, state["log_offsets"] = check_logs(logs, state.get("log_offsets", {}))
+    offsets = state.get("log_offsets", {})
+    log_results, new_offsets = check_logs(logs, offsets)
+    kb_results: list[Result] = []
+    kb = kb_dir(install_dir)
+    if kb is not None:
+        kb_fallback, new_offsets["kb:fallback.log"] = check_kb_fallback(
+            kb, offsets.get("kb:fallback.log", 0)
+        )
+        log_results.append(kb_fallback)
+        kb_results.append(check_kb_refresh(kb / "logs" / "refresh.log", now))
+    state["log_offsets"] = new_offsets
     log_results, state["log_last_hit"] = hold_log_alerts(
         log_results, state.get("log_last_hit", {}), now, LOG_ALERT_HOLD
     )
     results.extend(log_results)
+    results.extend(kb_results)
 
     last_probe = state.get("last_probe")
     due = (
