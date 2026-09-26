@@ -13,6 +13,11 @@
     PowerShell 5.1 (the host that can raise a toast). Output is appended to
     logs\health-check.log.
 
+    A toast only reaches someone at the desk. When HEALTH_NOTIFY_HERMES names a
+    `hermes send --to` target (environment, or the install's .env), every
+    notice is also sent there, including "the check could not run". Same
+    notices, same cadence: state changes and a daily reminder, never every run.
+
 .PARAMETER HonchoDir
     Install directory. Defaults to this script's parent.
 
@@ -40,8 +45,24 @@ $ErrorActionPreference = 'Stop'
 if (-not $HonchoDir) { $HonchoDir = Split-Path $PSScriptRoot -Parent }
 Import-Module (Join-Path $PSScriptRoot 'HonchoNotify.psm1') -Force
 
+function Get-HealthSetting($name) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    $envFile = Join-Path $HonchoDir '.env'
+    if (-not $value -and (Test-Path $envFile)) {
+        foreach ($line in Get-Content $envFile) {
+            $key, $raw = $line.Trim() -split '=', 2
+            if ($null -ne $raw -and $key.Trim() -eq $name) { $value = $raw.Trim().Trim('"').Trim("'") }
+        }
+    }
+    return $value
+}
+
+$hermesTarget = Get-HealthSetting 'HEALTH_NOTIFY_HERMES'
+
 function Notice($title, $text) {
-    if ($Notify) { Send-HonchoNotice -Title $title -Text $text } else { Write-Host "[notice] $title - $text" }
+    if (-not $Notify) { Write-Host "[notice] $title - $text"; return }
+    Send-HonchoNotice -Title $title -Text $text
+    if ($hermesTarget) { Send-HonchoRemoteNotice -Target $hermesTarget -Title $title -Text $text }
 }
 
 Write-Host ("[*] health check at {0:yyyy-MM-dd HH:mm:ss zzz}" -f (Get-Date))

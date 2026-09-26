@@ -39,7 +39,9 @@ model endpoints and has its own fallback, so an outage reaches it too:
 
 A notification is raised when a check changes state (alert or recovery), plus
 a daily reminder while it stays in alert, so a persistent problem is neither
-silent nor spammed every 15 minutes.
+silent nor spammed every 15 minutes. With ``HEALTH_NOTIFY_HERMES`` set, the
+wrapper also sends each one through ``hermes send`` to that target (see
+Check-HonchoHealth.ps1).
 
 Database access is read-only (the session is set READ ONLY before querying).
 No secret is ever printed; endpoints are identified by host and model.
@@ -323,20 +325,26 @@ def check_logs(
     return results, new_offsets
 
 
-def kb_dir(install_dir: Path) -> Path | None:
-    """The personal-kb checkout to watch, or None when not configured.
+def setting(install_dir: Path, name: str) -> str | None:
+    """An optional health-check setting, or None when not configured.
 
     Read from the environment first, then from this install's ``.env``, where
     the rest of its settings live. The scheduled task inherits no shell, so the
     ``.env`` is the reliable place for it.
     """
-    value = os.environ.get(KB_DIR_SETTING)
+    value = os.environ.get(name)
     env_file = install_dir / ".env"
     if not value and env_file.exists():
         for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
             key, sep, raw = line.strip().partition("=")
-            if sep and key.strip() == KB_DIR_SETTING:
+            if sep and key.strip() == name:
                 value = raw.strip().strip('"').strip("'")
+    return value or None
+
+
+def kb_dir(install_dir: Path) -> Path | None:
+    """The personal-kb checkout to watch, or None when not configured."""
+    value = setting(install_dir, KB_DIR_SETTING)
     return Path(value) if value else None
 
 
