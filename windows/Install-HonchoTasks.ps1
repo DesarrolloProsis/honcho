@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Register the Honcho API and deriver as logon-triggered Scheduled Tasks,
-    plus a weekly check for new upstream releases.
+    plus a 15-minute health check and a weekly check for new upstream releases.
 
 .DESCRIPTION
     Honcho's only clients (agents, editors) are interactive, so the services are
@@ -12,6 +12,11 @@
     "Honcho Upstream Check" runs Update-Honcho.ps1 -Check -Notify every Monday
     and raises a desktop notification when a newer release tag exists. It only
     reports; it never updates. Nothing else tells you a release happened.
+
+    "Honcho Health Check" runs Check-HonchoHealth.ps1 -Notify every 15 minutes
+    and raises a desktop notification when Honcho stops forming memory, a
+    model endpoint starts failing, or a call falls back to its backup. See
+    health_check.py for the checks.
 
     All tasks launch through windows\start-honcho-hidden.vbs so no console
     window appears on the desktop.
@@ -74,7 +79,8 @@ if (-not $HonchoDir) { $HonchoDir = Split-Path $PSScriptRoot -Parent }
 $tasks = @(
     @{ Name = 'Honcho API';            Component = 'api';     Service = $true },
     @{ Name = 'Honcho Deriver';        Component = 'deriver'; Service = $true },
-    @{ Name = 'Honcho Upstream Check'; Component = 'check';   Service = $false }
+    @{ Name = 'Honcho Upstream Check'; Component = 'check';   Service = $false },
+    @{ Name = 'Honcho Health Check';   Component = 'health';  Service = $false }
 )
 
 function Stop-ExistingService {
@@ -138,8 +144,14 @@ foreach ($t in $tasks) {
             -MultipleInstances IgnoreNew `
             -ExecutionTimeLimit ([TimeSpan]::Zero)
     } else {
-        # StartWhenAvailable: a Monday spent logged off runs at the next logon.
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00'
+        if ($t.Component -eq 'health') {
+            # Every 15 minutes, indefinitely (no -RepetitionDuration).
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                -RepetitionInterval (New-TimeSpan -Minutes 15)
+        } else {
+            # StartWhenAvailable: a Monday spent logged off runs at the next logon.
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00'
+        }
         $settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
@@ -149,6 +161,7 @@ foreach ($t in $tasks) {
     }
 
     $description = if ($t.Service) { 'Honcho self-hosted memory service' }
+                   elseif ($t.Component -eq 'health') { 'Honcho health check every 15 minutes; notifies on problems' }
                    else { 'Weekly check for a newer Honcho release tag; reports only' }
     $existed = [bool](Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue)
 

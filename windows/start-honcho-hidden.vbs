@@ -8,10 +8,12 @@
 '     wscript.exe "<install>\windows\start-honcho-hidden.vbs" api
 '     wscript.exe "<install>\windows\start-honcho-hidden.vbs" deriver
 '     wscript.exe "<install>\windows\start-honcho-hidden.vbs" check
+'     wscript.exe "<install>\windows\start-honcho-hidden.vbs" health
 '
-' "check" runs windows\Update-Honcho.ps1 -Check -Notify under Windows
-' PowerShell 5.1, which is always present and is the host that can raise a
-' desktop notification. Its exit code (2 = newer release tag) is passed through.
+' "check" runs windows\Update-Honcho.ps1 -Check -Notify and "health" runs
+' windows\Check-HonchoHealth.ps1 -Notify, both under Windows PowerShell 5.1,
+' which is always present and is the host that can raise a desktop
+' notification. Exit codes are passed through (check: 2 = newer release tag).
 '
 ' Paths are derived from this script's own location, so the install directory
 ' can be anywhere and nothing here needs editing. Do NOT hardcode a profile
@@ -32,7 +34,7 @@
 Option Explicit
 
 Dim shell, fso, component, scriptDir, honchoDir, pythonExe, target, logFile, command, exitCode, q
-Dim psExe
+Dim psExe, psScript, psArgs, logName
 q = Chr(34)
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -51,15 +53,22 @@ If component = "api" Then
 ElseIf component = "deriver" Then
     target = "-m src.deriver"
 ElseIf component = "check" Then
-    psExe = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
-    target = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & _
-             q & fso.BuildPath(scriptDir, "Update-Honcho.ps1") & q & " -Check -Notify"
+    psScript = "Update-Honcho.ps1"
+    psArgs = " -Check -Notify"
+    logName = "upstream-check"
+ElseIf component = "health" Then
+    psScript = "Check-HonchoHealth.ps1"
+    psArgs = " -Notify"
+    logName = "health-check"
 Else
     WScript.Quit 2
 End If
 
-If component = "check" Then
-    logFile = fso.BuildPath(honchoDir, "logs\upstream-check.log")
+If psScript <> "" Then
+    psExe = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+    target = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & _
+             q & fso.BuildPath(scriptDir, psScript) & q & psArgs
+    logFile = fso.BuildPath(honchoDir, "logs\" & logName & ".log")
 Else
     logFile = fso.BuildPath(honchoDir, "logs\" & component & ".log")
     If Not fso.FileExists(pythonExe) Then WScript.Quit 3
@@ -78,7 +87,7 @@ shell.CurrentDirectory = honchoDir
 ' -u keeps stdout unbuffered so the log stays current and survives a kill.
 ' 2>&1 is essential, not optional: logging.basicConfig writes to stderr, so
 ' redirecting stdout alone still discards every log line.
-If component = "check" Then
+If psScript <> "" Then
     command = "cmd.exe /c " & q & q & psExe & q & " " & target & _
               " >> " & q & logFile & q & " 2>&1" & q
 Else

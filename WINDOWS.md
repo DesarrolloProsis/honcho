@@ -130,10 +130,51 @@ uv run python -m src.deriver         # deriver, separate terminal
 Registers both as logon-triggered Scheduled Tasks, launched through
 `windows\start-honcho-hidden.vbs` so no console window appears. It also registers
 **Honcho Upstream Check**, which runs every Monday and raises a desktop notification when a
-newer upstream release tag exists (see [Staying current](#staying-current)).
+newer upstream release tag exists (see [Staying current](#staying-current)), and
+**Honcho Health Check**, every 15 minutes (see [Health monitoring](#health-monitoring)).
 
 **Stop them with `.\windows\Stop-HonchoService.ps1` — never `Stop-ScheduledTask` alone.**
 See [Stopping the service](#stopping-the-service).
+
+---
+
+## Health monitoring
+
+**A Honcho whose model provider fails keeps serving reads and stops learning, silently.** Every
+layer handles the failure on its own terms: the LLM layer retries and logs a warning, the queue
+marks each item processed-with-error (terminal, never retried), the reconciler marks embeddings
+`failed` after about three hours (terminal), and the summarizer skips the summary while the queue
+records success. Context injection keeps working from stored conclusions, so agents look healthy
+while nothing new is being remembered. On this fork's own install that went unnoticed for 36 hours.
+
+`windows\health_check.py` looks for exactly those end states, and actively probes every model
+endpoint the install is configured to use, so a revoked key is caught within the hour even with no
+traffic:
+
+| Check | Alerts when |
+|---|---|
+| `api` | the API does not answer 200 |
+| `queue-errors` | a queue item finished with an error in the last hour |
+| `queue-stuck` | unprocessed deriver work is older than 2 hours |
+| `embed-failed` | any embedding is in the terminal `failed` state |
+| `embed-backlog` | an embedding has been pending for more than an hour |
+| `fallback-active` | a model call switched to its configured backup. **Running on the backup is an alert**: it is the last margin before the next outage |
+| `summary-errors` | a session summary failed (only the log records it) |
+| `probe:*` | an hourly one-token call to an endpoint fails (401, 404, unreachable) |
+
+Notifications fire on a **change** (into alert, or recovered) plus a daily reminder while a check
+stays in alert, never every 15 minutes. Database access is read-only; no key is ever printed.
+
+```powershell
+.\windows\Check-HonchoHealth.ps1               # print findings, no notification
+.\windows\Check-HonchoHealth.ps1 -ForceProbe   # probe every endpoint now
+```
+
+Output from the scheduled runs goes to `logs\health-check.log`; state (last results, log offsets,
+probe times) to `logs\health-state.json`. Delete the state file to re-announce every open alert.
+
+The check always reports on the install it lives in: `src.config` locates `.env` relative to the
+code, so a copy in a dev checkout reads the dev settings and database, not the live ones.
 
 ---
 
@@ -324,8 +365,10 @@ lingering unexamined.
 |---|---|
 | `run_api.py` | API entry point on the selector event loop (blocker 3) |
 | `start-honcho-hidden.vbs` | Console-free launcher for Scheduled Tasks |
-| `Install-HonchoTasks.ps1` | Register/unregister both services and the weekly upstream check |
+| `Install-HonchoTasks.ps1` | Register/unregister both services, the health check and the weekly upstream check |
 | `Stop-HonchoService.ps1` | Stop them **and verify** they actually stopped |
 | `Update-Honcho.ps1` | `-Check` reports a newer release tag; without it, rebases onto the tag |
+| `health_check.py`, `Check-HonchoHealth.ps1` | The 15-minute health check and its notifying wrapper |
+| `HonchoNotify.psm1` | Desktop notification helper shared by the scheduled tasks |
 
 Every script defaults its install directory to its own location, so a clone works unedited.
