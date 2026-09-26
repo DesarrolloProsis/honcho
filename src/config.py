@@ -385,12 +385,28 @@ class ModelConfig(BaseModel):
         )
 
 
+class ConfiguredEmbeddingFallbackSettings(BaseModel):
+    """A second endpoint serving the SAME embedding model as the primary.
+
+    Vectors from different models are not comparable, so a fallback that
+    served another model would silently corrupt similarity search against the
+    existing index. The parent validator enforces the model name; the health
+    check additionally proves vector-space identity against a stored vector,
+    since a matching name alone does not guarantee the same weights.
+    """
+
+    model: str
+    transport: EmbeddingTransport = "openai"
+    overrides: ModelOverrideSettings = Field(default_factory=ModelOverrideSettings)
+
+
 class ConfiguredEmbeddingModelSettings(BaseModel):
     """Operator-configurable persisted embedding settings."""
 
     model: str = "text-embedding-3-small"
     transport: EmbeddingTransport = "openai"
     overrides: ModelOverrideSettings = Field(default_factory=ModelOverrideSettings)
+    fallback: ConfiguredEmbeddingFallbackSettings | None = None
     dimensions_mode: EmbeddingDimensionsMode = "auto"
     encoding_format_mode: EmbeddingEncodingFormatMode = "auto"
     max_batch_size: Annotated[int, Field(gt=0)] | None = None
@@ -431,6 +447,22 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
             self.model = _default_embedding_model_for_transport(self.transport)
         return self
 
+    @model_validator(mode="after")
+    def _fallback_must_serve_the_same_model(
+        self,
+    ) -> "ConfiguredEmbeddingModelSettings":
+        if self.fallback is not None and (
+            self.fallback.model != self.model
+            or self.fallback.transport != self.transport
+        ):
+            raise ValueError(
+                "Embedding fallback must serve the same model as the primary "
+                + f"({self.transport}/{self.model}), got "
+                + f"{self.fallback.transport}/{self.fallback.model}. Vectors from "
+                + "different models cannot share an index."
+            )
+        return self
+
 
 class EmbeddingModelConfig(BaseModel):
     """Runtime embedding configuration with resolved credentials."""
@@ -442,6 +474,8 @@ class EmbeddingModelConfig(BaseModel):
     max_batch_size: Annotated[int, Field(gt=0)] | None = None
     # Client HTTP timeout in seconds. OpenAI receives seconds; Gemini converts to ms.
     timeout: float | None = None
+    # Same-model backup endpoint, resolved; see ConfiguredEmbeddingFallbackSettings.
+    fallback: "EmbeddingModelConfig | None" = None
 
     @field_validator("timeout", mode="before")
     @classmethod
@@ -568,6 +602,21 @@ def resolve_embedding_model_config(
     if api_key is None:
         api_key = _default_embedding_api_key(configured.transport)
 
+    fallback: EmbeddingModelConfig | None = None
+    if configured.fallback is not None:
+        fb = configured.fallback
+        fb_key = _resolve_secret(fb.overrides.api_key, fb.overrides.api_key_env)
+        fallback = EmbeddingModelConfig(
+            model=fb.model,
+            transport=fb.transport,
+            api_key=fb_key
+            if fb_key is not None
+            else _default_embedding_api_key(fb.transport),
+            base_url=fb.overrides.base_url,
+            max_batch_size=configured.max_batch_size,
+            timeout=configured.timeout,
+        )
+
     return EmbeddingModelConfig(
         model=configured.model,
         transport=configured.transport,
@@ -575,6 +624,7 @@ def resolve_embedding_model_config(
         base_url=configured.overrides.base_url,
         max_batch_size=configured.max_batch_size,
         timeout=configured.timeout,
+        fallback=fallback,
     )
 
 

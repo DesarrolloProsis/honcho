@@ -704,6 +704,7 @@ class EmbeddingClient:
     """
 
     _instance: _EmbeddingClient | None = None
+    _fallback_instance: _EmbeddingClient | None = None
     _instance_signature: tuple[object, ...] | None = None
     _lock: threading.Lock = threading.Lock()
     _wrapper_instance: EmbeddingClient | None = None
@@ -726,13 +727,11 @@ class EmbeddingClient:
             with self._lock:
                 if self._instance is None or self._instance_signature != signature:
                     runtime_config = self._resolve_runtime_config()
-                    self._instance = _EmbeddingClient(
-                        runtime_config,
-                        vector_dimensions=settings.EMBEDDING.VECTOR_DIMENSIONS,
-                        max_input_tokens=settings.EMBEDDING.MAX_INPUT_TOKENS,
-                        max_tokens_per_request=settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,
-                        send_dimensions=settings.EMBEDDING.resolve_send_dimensions(),
-                        encoding_format=settings.EMBEDDING.resolve_encoding_format(),
+                    self._instance = self._build_client(runtime_config)
+                    self._fallback_instance = (
+                        self._build_client(runtime_config.fallback)
+                        if runtime_config.fallback is not None
+                        else None
                     )
                     self._instance_signature = signature
                     logger.debug(
@@ -746,14 +745,27 @@ class EmbeddingClient:
     def _resolve_runtime_config(self) -> EmbeddingModelConfig:
         return resolve_embedding_model_config(settings.EMBEDDING.MODEL_CONFIG)
 
+    @staticmethod
+    def _build_client(config: EmbeddingModelConfig) -> _EmbeddingClient:
+        return _EmbeddingClient(
+            config,
+            vector_dimensions=settings.EMBEDDING.VECTOR_DIMENSIONS,
+            max_input_tokens=settings.EMBEDDING.MAX_INPUT_TOKENS,
+            max_tokens_per_request=settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,
+            send_dimensions=settings.EMBEDDING.resolve_send_dimensions(),
+            encoding_format=settings.EMBEDDING.resolve_encoding_format(),
+        )
+
     def _get_settings_signature(self) -> tuple[object, ...]:
         runtime_config = self._resolve_runtime_config()
+        fb = runtime_config.fallback
         return (
             runtime_config.transport,
             runtime_config.model,
             runtime_config.api_key,
             runtime_config.base_url,
             runtime_config.max_batch_size,
+            (fb.transport, fb.model, fb.api_key, fb.base_url) if fb else None,
             settings.EMBEDDING.VECTOR_DIMENSIONS,
             settings.EMBEDDING.MAX_INPUT_TOKENS,
             settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,
@@ -761,9 +773,45 @@ class EmbeddingClient:
             settings.EMBEDDING.resolve_encoding_format(),
         )
 
+    async def _with_fallback(
+        self, call: Callable[[_EmbeddingClient], Awaitable[_T]]
+    ) -> _T:
+        """Run `call` on the primary client; on failure, once on the fallback.
+
+        The primary has already exhausted its own retries when this catches.
+        Input errors (token limits, and the dimension/count guards, which are
+        ValueErrors) are not provider failures and are re-raised: the fallback
+        serves the same model, so it would reject the same input.
+
+        The warning deliberately matches the LLM layer's "switching from ...
+        to backup ..." shape so one log watcher sees both.
+        """
+        primary = self._get_client()
+        fallback = self._fallback_instance
+        try:
+            return await call(primary)
+        except (EmbeddingTokenLimitError, ValueError):
+            raise
+        except Exception as e:
+            if fallback is None:
+                raise
+            logger.warning(
+                "Embedding call failed on %s/%s (%s: %s); switching from %s/%s "
+                + "to backup %s/%s",
+                primary.transport,
+                primary.model,
+                type(e).__name__,
+                e,
+                primary.transport,
+                primary.model,
+                fallback.transport,
+                fallback.model,
+            )
+            return await call(fallback)
+
     async def embed(self, query: str) -> list[float]:
         """Embed a single query string."""
-        return await self._get_client().embed(query)
+        return await self._with_fallback(lambda c: c.embed(query))
 
     async def simple_batch_embed(
         self,
@@ -772,8 +820,8 @@ class EmbeddingClient:
         on_oversize: Literal["raise", "truncate"] = "raise",
     ) -> list[list[float]]:
         """Batch embed a list of text strings (each must fit token limit)."""
-        return await self._get_client().simple_batch_embed(
-            texts, on_oversize=on_oversize
+        return await self._with_fallback(
+            lambda c: c.simple_batch_embed(texts, on_oversize=on_oversize)
         )
 
     def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
@@ -784,7 +832,7 @@ class EmbeddingClient:
         self, id_resource_dict: dict[str, str]
     ) -> dict[str, list[list[float]]]:
         """Embed multiple texts, chunking long ones and batching API calls."""
-        return await self._get_client().batch_embed(id_resource_dict)
+        return await self._with_fallback(lambda c: c.batch_embed(id_resource_dict))
 
     @property
     def provider(self) -> str:
