@@ -249,6 +249,13 @@ git fetch upstream --tags
 git log --oneline $(git describe --tags --abbrev=0)..upstream/main   # what's new
 ```
 
+Or let the updater report it, including whether the release changes migrations or the Python
+floor and whether upstream has fixed any Windows blocker natively. It makes no changes:
+
+```powershell
+.\windows\Update-Honcho.ps1 -Check     # exit 0 = up to date, 2 = newer tag, 1 = error
+```
+
 To see the current patch series and its base:
 
 ```powershell
@@ -299,5 +306,6 @@ lingering unexamined.
 | `start-honcho-hidden.vbs` | Console-free launcher for Scheduled Tasks |
 | `Install-HonchoTasks.ps1` | Register/unregister both services |
 | `Stop-HonchoService.ps1` | Stop them **and verify** they actually stopped |
+| `Update-Honcho.ps1` | `-Check` reports a newer release tag; without it, rebases onto the tag |
 
 Every script defaults its install directory to its own location, so a clone works unedited.

@@ -20,6 +20,11 @@
 .PARAMETER Tag
     Rebase onto this tag instead of the newest one.
 
+.OUTPUTS
+    Exit codes: 0 = up to date (or update applied), 1 = failure,
+    2 = -Check found a newer release tag. 2 is deliberately not 0 so a
+    scheduler or wrapper can tell "nothing to do" from "action needed".
+
 .NOTES
     Fail-closed by design. In PowerShell, $ErrorActionPreference = 'Stop' does
     NOT make a non-zero exit from a native command (git, uv, alembic) a
@@ -130,7 +135,7 @@ foreach ($c in $checks) {
     }
 }
 
-if ($Check) { Info "check-only mode, stopping here."; exit 0 }
+if ($Check) { Info "check-only mode, stopping here."; exit 2 }
 
 # --- 5. safety net -----------------------------------------------------------
 $backupTag = "pre-update-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss')
